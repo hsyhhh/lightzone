@@ -1,0 +1,28 @@
+Q1: Does KVM in Linux-5.10-rc1 support nested virtualization for ARM64?
+A1: No.
+
+Q2: How to fix the mmu notifier?
+A2: LightZone Lowvisor registers new mmu notifiers when nested mmu (lzproc_t) structures
+
+Q3: How to synchronize the guest LightZone processes' stage two page tables with the KVM guest stage two page tables?
+A3: First, MMU notifier is not enough because other conditions, such as changing the KVM memory slots, also modifies the stage two
+    page tables. We refer to the NEVE KVM patch V1. In the patch, we trace the field called `nested_mmus` and find all related 
+    operations on the nested stage two page tables. Hence, in theory, if the KVM patch has bugs or misses a scenario, our patch is
+    incomplete as well. In practice, our hypervisor product is not KVM, and our experiment and daily use of ARM KVM show the patch
+    code is not triggered.
+    In conclusion, we need more real-world tests, like Fuzzing and perhaps Formal Verification, to guarantee the page table of a
+    guest LightZone application is synchronized with the KVM stage two page table.
+
+Q4: Is there overlap between the LightZone mmu notifier and the patch?
+A4: It seems YES. However, since LightZone page table is protected by a spinlock, any circumstance is safe (though less efficiency).
+    We find that set_pte overlapped (because of KVM code annotation).
+
+Q5: Why not use a structure called XXX_ops in the LightZone patch?
+A5: XXX_ops should be defined in several C source files or one header file, slowing down the compilation.
+
+Listed sites of `nested_mmus` in NEVE V1 patch:
+
+    void kvm_nested_s2_wp(struct kvm *kvm); in kvm_mmu_wp_memory_region; in kvm_arch_mmu_enable_log_dirty_pt_masked.
+    void kvm_nested_s2_clear(struct kvm *kvm); in kvm_arch_vcpu_ioctl_vcpu_init; in kvm_unmap_hva_handler; in kvm_set_spte_handler;
+        in kvm_arch_flush_shadow_memslot.
+    void kvm_nested_s2_flush(struct kvm *kvm); in stage2_flush_vm.

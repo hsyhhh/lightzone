@@ -1,0 +1,12 @@
+#ifndef __ARM64_LZHWDEFS_H__
+#define __ARM64_LZHWDEFS_H__
+
+#define ARM_EXCEPTION_IRQ			0
+#define ARM_EXCEPTION_EL1_SERROR	1
+#define ARM_EXCEPTION_TRAP			2
+#define ARM_EXCEPTION_IL			3
+
+#define ARM_EXCEPTION_NO_MLOCK		0x0000beee
+#define ARM_EXCEPTION_NO_VMID		0x0000beef
+
+#endif

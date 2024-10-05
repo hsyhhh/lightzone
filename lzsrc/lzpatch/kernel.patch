@@ -1,0 +1,403 @@
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index e62005317..12065acb9 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -841,7 +841,7 @@ static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
+  * the kernel can handle, and then we build all the user-level signal handling
+  * stack-frames in one go after that.
+  */
+-static void do_signal(struct pt_regs *regs)
++void do_signal(struct pt_regs *regs, void *lzcpu)
+ {
+ 	unsigned long continue_addr = 0, restart_addr = 0;
+ 	int retval = 0;
+@@ -880,7 +880,7 @@ static void do_signal(struct pt_regs *regs)
+ 	 * Get the signal to deliver. When running under ptrace, at this point
+ 	 * the debugger may change all of our registers.
+ 	 */
+-	if (get_signal(&ksig)) {
++	if (get_signal(&ksig, lzcpu)) {
+ 		/*
+ 		 * Depending on the signal settings, we may need to revert the
+ 		 * decision to restart the system call, but skip this if a
+@@ -937,7 +937,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 			}
+ 
+ 			if (thread_flags & _TIF_SIGPENDING)
+-				do_signal(regs);
++				do_signal(regs, NULL);
+ 
+ 			if (thread_flags & _TIF_NOTIFY_RESUME) {
+ 				tracehook_notify_resume(regs);
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 5bc978be8..6ba9fdf72 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -477,7 +477,7 @@ void force_vm_exit(const cpumask_t *mask)
+  * use a VMID for the new generation, we must flush necessary caches and TLBs
+  * on all CPUs.
+  */
+-static bool need_new_vmid_gen(struct kvm_vmid *vmid)
++bool need_new_vmid_gen(struct kvm_vmid *vmid)
+ {
+ 	u64 current_vmid_gen = atomic64_read(&kvm_vmid_gen);
+ 	smp_rmb(); /* Orders read of kvm_vmid_gen and kvm->arch.vmid */
+@@ -487,11 +487,16 @@ static bool need_new_vmid_gen(struct kvm_vmid *vmid)
+ /**
+  * update_vmid - Update the vmid with a valid VMID for the current generation
+  * @vmid: The stage-2 VMID information struct
++ * @irq_disabled: The function is called in non-interruptable context
++ * 
++ * return true if failed to update VMID due to the conflict of smp_call and 
++ * disabled-interrupt
++ * 
+  */
+-void update_vmid(struct kvm_vmid *vmid)
++bool update_vmid(struct kvm_vmid *vmid, bool irq_disabled)
+ {
+ 	if (!need_new_vmid_gen(vmid))
+-		return;
++		return false;
+ 
+ 	spin_lock(&kvm_vmid_lock);
+ 
+@@ -502,11 +507,16 @@ void update_vmid(struct kvm_vmid *vmid)
+ 	 */
+ 	if (!need_new_vmid_gen(vmid)) {
+ 		spin_unlock(&kvm_vmid_lock);
+-		return;
++		return false;
+ 	}
+ 
+ 	/* First user of a new VMID generation? */
+ 	if (unlikely(kvm_next_vmid == 0)) {
++		if (unlikely(irq_disabled)) {
++			spin_unlock(&kvm_vmid_lock);
++			return true;
++		}
++
+ 		atomic64_inc(&kvm_vmid_gen);
+ 		kvm_next_vmid = 1;
+ 
+@@ -532,6 +542,7 @@ void update_vmid(struct kvm_vmid *vmid)
+ 	WRITE_ONCE(vmid->vmid_gen, atomic64_read(&kvm_vmid_gen));
+ 
+ 	spin_unlock(&kvm_vmid_lock);
++	return false;
+ }
+ 
+ static int kvm_vcpu_first_run_init(struct kvm_vcpu *vcpu)
+@@ -699,7 +710,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 		 */
+ 		cond_resched();
+ 
+-		update_vmid(&vcpu->arch.hw_mmu->vmid);
++		update_vmid(&vcpu->arch.hw_mmu->vmid, false);
+ 
+ 		check_vcpu_requests(vcpu);
+ 
+@@ -1025,9 +1036,13 @@ static int kvm_arch_vcpu_ioctl_vcpu_init(struct kvm_vcpu *vcpu,
+ 	 * imply CTR_EL0.DIC.
+ 	 */
+ 	if (vcpu->arch.has_run_once) {
+-		if (!cpus_have_final_cap(ARM64_HAS_STAGE2_FWB))
++		if (!cpus_have_final_cap(ARM64_HAS_STAGE2_FWB)) {
++			extern void (*lightzone_lowvisor_ops_clear)(struct kvm *);
++			extern bool lightzone_lowvisor_ops_valid;
+ 			stage2_unmap_vm(vcpu->kvm);
+-		else
++			if (lightzone_lowvisor_ops_valid)
++				lightzone_lowvisor_ops_clear(vcpu->kvm);
++		} else
+ 			__flush_icache_all();
+ 	}
+ 
+diff --git a/arch/arm64/kvm/debug.c b/arch/arm64/kvm/debug.c
+index 2484b2cca..7241d2373 100644
+--- a/arch/arm64/kvm/debug.c
++++ b/arch/arm64/kvm/debug.c
+@@ -87,10 +87,7 @@ static void kvm_arm_setup_mdcr_el2(struct kvm_vcpu *vcpu)
+ 	 * to the profiling buffer.
+ 	 */
+ 	vcpu->arch.mdcr_el2 = __this_cpu_read(mdcr_el2) & MDCR_EL2_HPMN_MASK;
+-	vcpu->arch.mdcr_el2 |= (MDCR_EL2_TPM |
+-				MDCR_EL2_TPMS |
+-				MDCR_EL2_TTRF |
+-				MDCR_EL2_TPMCR |
++	vcpu->arch.mdcr_el2 |= (MDCR_EL2_TTRF |
+ 				MDCR_EL2_TDRA |
+ 				MDCR_EL2_TDOSA);
+ 
+diff --git a/arch/arm64/kvm/hyp/include/hyp/switch.h b/arch/arm64/kvm/hyp/include/hyp/switch.h
+index 8116ae1e6..29165f38c 100644
+--- a/arch/arm64/kvm/hyp/include/hyp/switch.h
++++ b/arch/arm64/kvm/hyp/include/hyp/switch.h
+@@ -399,6 +399,8 @@ static inline bool __hyp_handle_ptrauth(struct kvm_vcpu *vcpu)
+ 	return true;
+ }
+ 
++extern bool (*lightzone_lowvisor_early_handler)(struct kvm_vcpu *, u64 *);
++
+ /*
+  * Return true when we were able to fixup the guest exit and should return to
+  * the guest, false when we should restore the host state and return to the
+@@ -428,6 +430,9 @@ static inline bool fixup_guest_exit(struct kvm_vcpu *vcpu, u64 *exit_code)
+ 	    kvm_vcpu_trap_get_class(vcpu) == ESR_ELx_EC_SYS64 &&
+ 	    handle_tx2_tvm(vcpu))
+ 		goto guest;
++	
++	if (lightzone_lowvisor_early_handler && lightzone_lowvisor_early_handler(vcpu, exit_code))
++		goto guest;
+ 
+ 	/*
+ 	 * We trap the first access to the FP/SIMD to save the host context
+diff --git a/arch/arm64/kvm/hyp/nvhe/switch.c b/arch/arm64/kvm/hyp/nvhe/switch.c
+index 662459684..b91e979b9 100644
+--- a/arch/arm64/kvm/hyp/nvhe/switch.c
++++ b/arch/arm64/kvm/hyp/nvhe/switch.c
+@@ -162,6 +162,8 @@ static void __pmu_switch_to_host(struct kvm_cpu_context *host_ctxt)
+ 		write_sysreg(pmu->events_host, pmcntenset_el0);
+ }
+ 
++bool (*lightzone_lowvisor_early_handler)(struct kvm_vcpu *, u64 *) = NULL;
++
+ /* Switch to the guest for legacy non-VHE systems */
+ int __kvm_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+diff --git a/arch/arm64/kvm/hyp/vhe/switch.c b/arch/arm64/kvm/hyp/vhe/switch.c
+index 62546e20b..ed73cbb00 100644
+--- a/arch/arm64/kvm/hyp/vhe/switch.c
++++ b/arch/arm64/kvm/hyp/vhe/switch.c
+@@ -106,6 +106,8 @@ void deactivate_traps_vhe_put(void)
+ 	__deactivate_traps_common();
+ }
+ 
++bool (*lightzone_lowvisor_early_handler)(struct kvm_vcpu *, u64 *) = NULL;
++
+ /* Switch to the guest for VHE systems running in EL2 */
+ static int __kvm_vcpu_run_vhe(struct kvm_vcpu *vcpu)
+ {
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index 26068456e..f3e62f005 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -31,6 +31,10 @@ static phys_addr_t hyp_idmap_vector;
+ 
+ static unsigned long io_map_base;
+ 
++void (*lightzone_lowvisor_ops_wp)(struct kvm *) = NULL;
++void (*lightzone_lowvisor_ops_flush)(struct kvm *, struct kvm_memory_slot *) = NULL;
++void (*lightzone_lowvisor_ops_clear)(struct kvm *) = NULL;
++bool lightzone_lowvisor_ops_valid = false;
+ 
+ /*
+  * Release kvm_mmu_lock periodically if the memory region is large. Otherwise,
+@@ -167,8 +171,11 @@ static void stage2_flush_vm(struct kvm *kvm)
+ 	spin_lock(&kvm->mmu_lock);
+ 
+ 	slots = kvm_memslots(kvm);
+-	kvm_for_each_memslot(memslot, slots)
++	kvm_for_each_memslot(memslot, slots) {
+ 		stage2_flush_memslot(kvm, memslot);
++		if (lightzone_lowvisor_ops_valid)
++			lightzone_lowvisor_ops_flush(kvm, memslot);
++	}
+ 
+ 	spin_unlock(&kvm->mmu_lock);
+ 	srcu_read_unlock(&kvm->srcu, idx);
+@@ -436,6 +443,8 @@ static void stage2_unmap_memslot(struct kvm *kvm,
+ 		if (!(vma->vm_flags & VM_PFNMAP)) {
+ 			gpa_t gpa = addr + (vm_start - memslot->userspace_addr);
+ 			unmap_stage2_range(&kvm->arch.mmu, gpa, vm_end - vm_start);
++			if (lightzone_lowvisor_ops_valid)
++				lightzone_lowvisor_ops_clear(kvm);
+ 		}
+ 		hva = vm_end;
+ 	} while (hva < reg_end);
+@@ -569,6 +578,8 @@ void kvm_mmu_wp_memory_region(struct kvm *kvm, int slot)
+ 
+ 	spin_lock(&kvm->mmu_lock);
+ 	stage2_wp_range(&kvm->arch.mmu, start, end);
++	if (lightzone_lowvisor_ops_valid)
++		lightzone_lowvisor_ops_wp(kvm);
+ 	spin_unlock(&kvm->mmu_lock);
+ 	kvm_flush_remote_tlbs(kvm);
+ }
+@@ -593,6 +604,8 @@ static void kvm_mmu_write_protect_pt_masked(struct kvm *kvm,
+ 	phys_addr_t end = (base_gfn + __fls(mask) + 1) << PAGE_SHIFT;
+ 
+ 	stage2_wp_range(&kvm->arch.mmu, start, end);
++	if (lightzone_lowvisor_ops_valid)
++		lightzone_lowvisor_ops_wp(kvm);
+ }
+ 
+ /*
+@@ -1127,6 +1140,8 @@ static int kvm_set_spte_handler(struct kvm *kvm, gpa_t gpa, u64 size, void *data
+ 	 */
+ 	kvm_pgtable_stage2_map(kvm->arch.mmu.pgt, gpa, PAGE_SIZE,
+ 			       __pfn_to_phys(*pfn), KVM_PGTABLE_PROT_R, NULL);
++	if (lightzone_lowvisor_ops_valid)
++		lightzone_lowvisor_ops_clear(kvm);
+ 	return 0;
+ }
+ 
+@@ -1396,6 +1411,8 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
+ 
+ 	spin_lock(&kvm->mmu_lock);
+ 	unmap_stage2_range(&kvm->arch.mmu, gpa, size);
++	if (lightzone_lowvisor_ops_valid)
++		lightzone_lowvisor_ops_clear(kvm);
+ 	spin_unlock(&kvm->mmu_lock);
+ }
+ 
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 795d224f1..2ee8a6cbc 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -39,6 +39,8 @@
+ #include <asm/tlbflush.h>
+ #include <asm/traps.h>
+ 
++void (*lzhcr_check_update)(void) = NULL;
++
+ struct fault_info {
+ 	int	(*fn)(unsigned long addr, unsigned int esr,
+ 		      struct pt_regs *regs);
+@@ -457,6 +459,9 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
+ 	unsigned long vm_flags = VM_ACCESS_FLAGS;
+ 	unsigned int mm_flags = FAULT_FLAG_DEFAULT;
+ 
++	if (lzhcr_check_update)
++		lzhcr_check_update();
++
+ 	if (kprobe_page_fault(regs, esr))
+ 		return 0;
+ 
+@@ -600,6 +605,9 @@ static int __kprobes do_translation_fault(unsigned long addr,
+ 					  unsigned int esr,
+ 					  struct pt_regs *regs)
+ {
++	if (lzhcr_check_update)
++		lzhcr_check_update();
++	
+ 	if (is_ttbr0_addr(addr))
+ 		return do_page_fault(addr, esr, regs);
+ 
+@@ -610,12 +618,17 @@ static int __kprobes do_translation_fault(unsigned long addr,
+ static int do_alignment_fault(unsigned long addr, unsigned int esr,
+ 			      struct pt_regs *regs)
+ {
++	if (lzhcr_check_update)
++		lzhcr_check_update();
++
+ 	do_bad_area(addr, esr, regs);
+ 	return 0;
+ }
+ 
+ static int do_bad(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ {
++	if (lzhcr_check_update)
++		lzhcr_check_update();
+ 	return 1; /* "fault" */
+ }
+ 
+@@ -624,6 +637,9 @@ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ 	const struct fault_info *inf;
+ 	void __user *siaddr;
+ 
++	if (lzhcr_check_update)
++		lzhcr_check_update();
++
+ 	inf = esr_to_fault_info(esr);
+ 
+ 	if (user_mode(regs) && apei_claim_sea(regs) == 0) {
+@@ -646,6 +662,8 @@ static int do_sea(unsigned long addr, unsigned int esr, struct pt_regs *regs)
+ static int do_tag_check_fault(unsigned long addr, unsigned int esr,
+ 			      struct pt_regs *regs)
+ {
++	if (lzhcr_check_update)
++		lzhcr_check_update();
+ 	do_bad_area(addr, esr, regs);
+ 	return 0;
+ }
+diff --git a/include/linux/sched/task.h b/include/linux/sched/task.h
+index fa75f325d..dabd2c29d 100644
+--- a/include/linux/sched/task.h
++++ b/include/linux/sched/task.h
+@@ -31,6 +31,7 @@ struct kernel_clone_args {
+ 	/* Number of elements in *set_tid */
+ 	size_t set_tid_size;
+ 	int cgroup;
++	int lightzone_process;
+ 	struct cgroup *cgrp;
+ 	struct css_set *cset;
+ };
+diff --git a/include/linux/signal.h b/include/linux/signal.h
+index b256f9c65..236939004 100644
+--- a/include/linux/signal.h
++++ b/include/linux/signal.h
+@@ -287,7 +287,7 @@ extern void set_current_blocked(sigset_t *);
+ extern void __set_current_blocked(const sigset_t *);
+ extern int show_unhandled_signals;
+ 
+-extern bool get_signal(struct ksignal *ksig);
++extern bool get_signal(struct ksignal *ksig, void *lzcpu);
+ extern void signal_setup_done(int failed, struct ksignal *ksig, int stepping);
+ extern void exit_signals(struct task_struct *tsk);
+ extern void kernel_sigaction(int, __sighandler_t);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index a78c0b02e..4059d5283 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2111,7 +2111,11 @@ static __latent_entropy struct task_struct *copy_process(
+ 	retval = copy_io(clone_flags, p);
+ 	if (retval)
+ 		goto bad_fork_cleanup_namespaces;
++	if (args->lightzone_process)
++		p->flags |= PF_KTHREAD;
+ 	retval = copy_thread(clone_flags, args->stack, args->stack_size, p, args->tls);
++	if (args->lightzone_process)
++		p->flags &= (~PF_KTHREAD);
+ 	if (retval)
+ 		goto bad_fork_cleanup_io;
+ 
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 6bb2df4f6..80ea90919 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2514,7 +2514,9 @@ static int ptrace_signal(int signr, kernel_siginfo_t *info)
+ 	return signr;
+ }
+ 
+-bool get_signal(struct ksignal *ksig)
++void (*lzcpu_destroy_wrapper)(void *lzcpu) = NULL;
++
++bool get_signal(struct ksignal *ksig, void *lzcpu)
+ {
+ 	struct sighand_struct *sighand = current->sighand;
+ 	struct signal_struct *signal = current->signal;
+@@ -2742,6 +2744,9 @@ bool get_signal(struct ksignal *ksig)
+ 			do_coredump(&ksig->info);
+ 		}
+ 
++		if (lzcpu && lzcpu_destroy_wrapper)
++			lzcpu_destroy_wrapper(lzcpu);
++
+ 		/*
+ 		 * Death signals, no core dump.
+ 		 */
+diff --git a/mm/memory.c b/mm/memory.c
+index 4fe24cd86..fec4220cc 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4641,6 +4641,10 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 			   unsigned int flags, struct pt_regs *regs)
+ {
+ 	vm_fault_t ret;
++	extern void (*lzhcr_check_update)(void);
++
++	if (!regs && lzhcr_check_update)
++		lzhcr_check_update();
+ 
+ 	__set_current_state(TASK_RUNNING);
+ 
